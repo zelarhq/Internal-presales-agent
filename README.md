@@ -172,4 +172,9 @@ Refinement never regenerates.
 
 ---
 
+## 🚀 In Progress:
+
+- 🔍 Knowledge Base / RAG integration
+
+
 
