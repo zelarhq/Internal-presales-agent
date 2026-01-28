@@ -26,8 +26,7 @@ Persist Section + Update SessionState
 Load Existing SessionState (no mutation)
       │
       ▼
-Standalone Program
-  - refine_section
+  -refine_section
       │
       ▼
 Overwrite Section Content 
