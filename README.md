@@ -13,8 +13,7 @@ SessionState Graph (LangGraph)
       ├─► Sync Sections from DB (human edits)
       │
       ▼
-Standalone Program
-  - generate_section
+  - Generate_section
       │
       ▼
 Persist Section + Update SessionState
