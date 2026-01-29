@@ -26,7 +26,7 @@ PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "http://localhost:8080")
 # ============================================================
 
 # Comma-separated origins in env: "http://localhost:3000,https://your-frontend"
-_frontend_origins_env = os.getenv("FRONTEND_ORIGINS", "http://localhost:3000")
+_frontend_origins_env = os.getenv("FRONTEND_ORIGINS", "http://localhost:8080")
 FRONTEND_ORIGINS: List[str] = [o.strip() for o in _frontend_origins_env.split(",") if o.strip()]
 
 # ============================================================
