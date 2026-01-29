@@ -12,19 +12,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python deps
-COPY ./pyproject.toml ./requirements.txt
+COPY ./requirements.txt ./requirements.txt
+COPY ./pyproject.toml ./pyproject.toml
 COPY ./src ./src
 
 RUN pip install --upgrade pip && \
-    pip install -r requirements.txt
+    pip install --no-cache-dir -r requirements.txt
 
-# Ezydev can override these at deploy time
-ENV PORT=5001 \
-    API_KEY=abc123 \
+# Ezydev can override these at deploy time (set real values in the panel)
+ENV PORT=5001
+ENV API_KEY=abc123 \
     FRONTEND_ORIGINS=http://localhost:8080 \
-    PUBLIC_BASE_URL=http://localhost:${PORT}
+    PUBLIC_BASE_URL=http://localhost:5001
 
 EXPOSE ${PORT}
 
 # FastAPI app is in src/api/main.py -> app
-CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "5001"]
+CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "${PORT}"]
