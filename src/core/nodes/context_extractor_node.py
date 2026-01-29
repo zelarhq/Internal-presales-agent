@@ -160,11 +160,17 @@ async def ensure_context_extracted(state: SessionState) -> Dict[str, Any]:
         return {}
 
     if not state.transcripts:
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+        facts_path = OUT_DIR / f"{state.session_id}_facts.json"
+        facts_path.write_text("[]", encoding="utf-8")
         return {
-            "context_extracted": False,
-            "context": None,
+            "context_extracted": True,
+            "context": FileRef(
+                name="context_facts",
+                path=str(facts_path),
+            ),
         }
-        
+
     if not state.transcripts_loaded:
         raise ValueError("Transcripts must be loaded before extracting facts.")
     
