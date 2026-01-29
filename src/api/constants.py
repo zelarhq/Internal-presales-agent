@@ -19,7 +19,7 @@ HEADER_REQUEST_ID = "X-Request-Id"
 API_KEY: str = os.getenv("API_KEY", "abc123")
 
 # Useful if you want to generate absolute URLs in responses (optional)
-PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "http://localhost:8080")
+PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "http://localhost:5001")
 
 # ============================================================
 # CORS
