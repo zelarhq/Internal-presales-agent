@@ -17,7 +17,7 @@ COPY ./pyproject.toml ./pyproject.toml
 COPY ./src ./src
 
 RUN pip install --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install -r requirements.txt
 
 EXPOSE 5001
 
