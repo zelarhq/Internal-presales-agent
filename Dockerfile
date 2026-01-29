@@ -19,13 +19,7 @@ COPY ./src ./src
 RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Ezydev can override these at deploy time (set real values in the panel)
-ENV PORT=5001
-ENV API_KEY=abc123 \
-    FRONTEND_ORIGINS=http://localhost:8080 \
-    PUBLIC_BASE_URL=http://localhost:5001
-
-EXPOSE ${PORT}
+EXPOSE 5001
 
 # FastAPI app is in src/api/main.py -> app
-CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "${PORT}"]
+CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "5001"]
