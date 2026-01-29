@@ -316,7 +316,8 @@ async def refine_section_internal(
     Decode it here so the core refine logic always receives plain text.
     """
     try:
-        decoded_original = base64.b64decode(original_text).decode("utf-8")
+        padded = original_text + "=" * ((4 - len(original_text) % 4) % 4)
+        decoded_original = base64.b64decode(padded).decode("utf-8")
     except Exception as e:
         raise ValueError(f"Invalid base64 in original_text: {e}") from e
 
