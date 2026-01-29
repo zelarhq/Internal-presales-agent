@@ -247,12 +247,9 @@ async def write_section(
     if not getattr(state, "context_extracted", False):
         raise ValueError("Context must be extracted before section generation.")
 
-    if state.context and state.context.path:
-        facts_text = Path(state.context.path).read_text(
-            encoding="utf-8", errors="ignore"
-        )
-    else:
-        facts_text = ""
+    facts_text = Path(state.context.path).read_text(
+        encoding="utf-8", errors="ignore"
+    )
 
     # 2. Extracting prior sections for reference
     sections_dir = Path(".temp") / state.session_id / "sections"
