@@ -1,10 +1,11 @@
 # API Standardisation (Frontend Contract)
 
 This backend generates/refines report sections asynchronously.
-The frontend starts a job and then **polls using the same Request-Id**.
+The frontend starts a job and receives a `job_id`, then **polls the status endpoint** to check completion.
 
-> **Important:** Job state is stored **in-memory** only.
-> If the backend restarts, all request state is lost.
+> **Important:** Job state storage:
+> - **Development:** In-memory only. If the backend restarts, all job state is lost.
+> - **Production:** Redis-backed (if `REDIS_URL` is configured). Jobs persist across restarts.
 
 ---
 
@@ -45,17 +46,13 @@ Every request must include:
    - Must be included even on the *first* request.
    - Same value should be reused for all section calls in the same report workflow.
 
-3) `Request-Id`  
-   A frontend-generated request identifier (idempotency + polling).  
-   - New `Request-Id` for a new job.
-   - Same `Request-Id` reused for polling that job.
+**Note:** `Request-Id` header is **no longer required**. The backend automatically generates a unique `job_id` (UUID) for each job.
 
 Example:
 
 ```
 X-API-Key: <key>
 Session-Id: session_123
-Request-Id: req_001
 ```
 
 ---
@@ -131,12 +128,11 @@ Allowed `section_title` values:
 
 ### 1) POST `/generate`
 
-Starts generation of a report section.
+Starts generation of a report section. Returns immediately with a `job_id` for polling.
 
 **Headers**
 - `X-API-Key` (required)
 - `Session-Id` (required)
-- `Request-Id` (required)
 
 **Body**
 ```json
@@ -148,24 +144,21 @@ Starts generation of a report section.
 }
 ```
 
-**Response (initial call)**
-HTTP 202
+**Response**
+HTTP 202 Accepted
 
 ```json
 {
   "status": "processing",
-  "message": "Queued",
+  "message": "Job queued",
   "data": {
-    "ready": false,
-    "request_id": "req_001",
-    "session_id": "session_123"
+    "job_id": "550e8400-e29b-41d4-a716-446655440000",
+    "status": "pending"
   }
 }
 ```
 
-#### Polling `/generate`
-To poll, **send the same request again** with the same `Request-Id`.
-Backend will return one of:
+**Polling:** Use `GET /status/{job_id}` to check job status (see Status Endpoint below).
 
 **Busy**
 ```json
@@ -219,12 +212,11 @@ Backend will return one of:
 
 ### 2) POST `/refine`
 
-Starts refinement of an existing section.
+Starts refinement of an existing section. Returns immediately with a `job_id` for polling.
 
 **Headers**
 - `X-API-Key` (required)
 - `Session-Id` (required)
-- `Request-Id` (required)
 
 **Body**
 ```json
@@ -233,26 +225,101 @@ Starts refinement of an existing section.
   "customer_id": "string",
   "opportunity_id": "string",
   "section_title": "string (must be allowed for type)",
-  "original_text": "string (markdown/text)",
+  "original_text": "string (base64-encoded markdown/text)",
   "prompt": "string"
 }
 ```
 
 **Response**
-Same as `/generate` (HTTP 202 initially, then poll by resending with same `Request-Id`).
+HTTP 202 Accepted
 
-**Ready response (example)**
+```json
+{
+  "status": "processing",
+  "message": "Job queued",
+  "data": {
+    "job_id": "550e8400-e29b-41d4-a716-446655440000",
+    "status": "pending"
+  }
+}
+```
+
+**Polling:** Use `GET /status/{job_id}` to check job status (see Status Endpoint below).
+
+### 3) GET `/status/{job_id}`
+
+Get the status of a background job. Use this endpoint to poll for job completion.
+
+**Headers**
+- `X-API-Key` (required)
+
+**Path Parameters**
+- `job_id` (required) - The job ID returned from `/generate` or `/refine`
+
+**Response - Pending/Processing**
+HTTP 200 OK
+
+```json
+{
+  "status": "processing",
+  "message": "Job processing",
+  "data": {
+    "job_id": "550e8400-e29b-41d4-a716-446655440000",
+    "status": "processing"
+  }
+}
+```
+
+**Response - Completed**
+HTTP 200 OK
+
 ```json
 {
   "status": "ready",
-  "message": "Refined text ready",
+  "message": "Job completed",
   "data": {
-    "ready": true,
-    "request_id": "string",
-    "customer_id": "string",
-    "opportunity_id": "string",
-    "section_title": "string",
-    "refined_section_b64": "string"
+    "job_id": "550e8400-e29b-41d4-a716-446655440000",
+    "status": "completed",
+    "result": {
+      "customer_id": "string",
+      "opportunity_id": "string",
+      "section_title": "string",
+      "generated_section_b64": "string"
+    }
+  }
+}
+```
+
+For `/refine` jobs, the result contains `refined_section_b64` instead of `generated_section_b64`.
+
+**Response - Failed**
+HTTP 200 OK
+
+```json
+{
+  "status": "error",
+  "message": "Job failed",
+  "data": {
+    "job_id": "550e8400-e29b-41d4-a716-446655440000",
+    "status": "failed",
+    "error": {
+      "error_code": "INTERNAL_ERROR",
+      "message": "Error details"
+    }
+  }
+}
+```
+
+**Response - Not Found**
+HTTP 404 Not Found
+
+```json
+{
+  "status": "error",
+  "message": "Job 550e8400-e29b-41d4-a716-446655440000 not found",
+  "data": {
+    "error_code": "JOB_NOT_FOUND",
+    "path": "/status/550e8400-e29b-41d4-a716-446655440000"
   }
 }
 ```
@@ -261,21 +328,79 @@ Same as `/generate` (HTTP 202 initially, then poll by resending with same `Reque
 
 ## Polling Guidance (Frontend)
 
-- Poll by resending the same POST (`/generate` or `/refine`) with the same `Request-Id`.
-- Suggested backoff:
-  - Start at 1s, then 2s, 3s, 5s … up to 10s max.
-- Suggested timeout:
-  - 3–10 minutes depending on model / workload.
-- If backend returns 404 / loses job state (restart), treat as expired and re-submit using a new `Request-Id`.
+### Polling Flow
+
+1. **Start a job:** Call `POST /generate` or `POST /refine`
+2. **Extract `job_id`:** From the response `data.job_id`
+3. **Poll status:** Call `GET /status/{job_id}` repeatedly until status is `completed` or `failed`
+
+### Polling Strategy
+
+- **Initial delay:** Wait 1 second before first poll
+- **Backoff strategy:** 
+  - Start at 1s intervals
+  - Increase to 2s, 3s, 5s as time progresses
+  - Cap at 10s maximum interval
+- **Timeout:** 
+  - 3–10 minutes depending on model / workload
+  - If timeout reached, treat job as failed
+- **Error handling:**
+  - If `GET /status/{job_id}` returns 404, the job was lost (backend restart or expiration)
+  - Treat as expired and re-submit using a new request
+
+### Example Polling Code (Pseudocode)
+
+```javascript
+async function pollJobStatus(jobId, maxWaitTime = 600000) {
+  const startTime = Date.now();
+  let delay = 1000; // Start with 1 second
+  
+  while (Date.now() - startTime < maxWaitTime) {
+    await sleep(delay);
+    
+    const response = await fetch(`/status/${jobId}`, {
+      headers: { "X-API-Key": apiKey }
+    });
+    
+    const data = await response.json();
+    
+    if (data.status === "ready") {
+      return data.data.result; // Job completed
+    }
+    
+    if (data.status === "error" && data.data.status === "failed") {
+      throw new Error(data.data.error.message);
+    }
+    
+    if (response.status === 404) {
+      throw new Error("Job not found - may have expired");
+    }
+    
+    // Exponential backoff, capped at 10s
+    delay = Math.min(delay * 1.5, 10000);
+  }
+  
+  throw new Error("Job polling timeout");
+}
+```
 
 ---
 
 ## Notes / Gotchas
 
-1) **No persistence:** In-memory only. Restart wipes request state.
-2) **Request-Id is the job key:** Reusing it returns the same job status/result.
-3) **Session-Id required always:** The first call must include it.
+1) **Job persistence:**
+   - **Development:** In-memory only. Backend restart wipes all job state.
+   - **Production:** If `REDIS_URL` is configured, jobs persist across restarts (24-hour TTL).
+
+2) **Job IDs:** Backend generates UUIDs automatically. No need to provide `Request-Id` header.
+
+3) **Session-Id required always:** Must be included in every request to `/generate` and `/refine`.
+
 4) **Report type values:** Use exactly:
    - `Feasibility_report`
    - `Technical_scope`
    - `Commercial_proposal`
+
+5) **Job expiration:** Jobs expire after 24 hours (Redis) or on server restart (in-memory).
+
+6) **Status endpoint:** Always use `GET /status/{job_id}` for polling. Do not resend POST requests.

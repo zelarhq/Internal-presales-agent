@@ -28,7 +28,17 @@ async def prepare_session_state(
     opportunity_id: str,
     report_type: str,
 ):
-    async with AsyncSqliteSaver.from_conn_string(".temp/langgraph_checkpoints.sqlite") as checkpointer:
+    """
+    Prepare the LangGraph-backed session state.
+
+    SQLite will fail with "unable to open database file" if the parent
+    directory does not exist, so we ensure `.temp/` is created before
+    initialising the async checkpointer.
+    """
+    db_path = Path(".temp") / "langgraph_checkpoints.sqlite"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    async with AsyncSqliteSaver.from_conn_string(str(db_path)) as checkpointer:
         compiled = build_sessiongraph().compile(checkpointer=checkpointer)
 
         state_dict = await compiled.ainvoke(
@@ -230,12 +240,19 @@ async def write_section(
     print("Generating section...")
 
     # 1. Checking prerequisites....
-    if not state.context or not state.context_extracted:
-        raise ValueError("Context  must be extracted before section generation.")
+    # We require that the context extraction step has run at least once for
+    # this session, but it's valid for there to be no transcript-derived
+    # context (e.g. no files uploaded). In that case, context may be None and
+    # we simply proceed with an empty facts_text.
+    if not getattr(state, "context_extracted", False):
+        raise ValueError("Context must be extracted before section generation.")
 
-    facts_text = Path(state.context.path).read_text(
-        encoding="utf-8", errors="ignore"
-    )
+    if state.context and state.context.path:
+        facts_text = Path(state.context.path).read_text(
+            encoding="utf-8", errors="ignore"
+        )
+    else:
+        facts_text = ""
 
     # 2. Extracting prior sections for reference
     sections_dir = Path(".temp") / state.session_id / "sections"
@@ -283,6 +300,8 @@ async def write_section(
         section_key = section_cfg.key
         section_rules = section_cfg.llm_requirements
     else:
+        # Fallback: generate section key from title if not in schema
+        # This allows flexibility for sections not yet in the schema
         section_key = section_title.lower().replace(" ", "-")
         section_rules = (
             "This section is not defined in the schema. "

@@ -5,16 +5,17 @@ import os
 from typing import Any, Dict, Optional
 from src.core.generate_section import prepare_session_state, write_section
 from src.core.refine_section import refine_section
-from fastapi import FastAPI, Header, Request
+from fastapi import FastAPI, Header, Request, Path as PathParam
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from src.core.state import SessionState
 import uvicorn
 
 import src.api.constants as C
+from src.api.job_storage import get_storage, JobStatus, Job
     
 from pathlib import Path
 
@@ -42,20 +43,27 @@ app.add_middleware(
 # ============================================================
 
 def envelope(status: str, message: str, data: Any = None) -> Dict[str, Any]:
-    return {"status": status, "message": message, "data": data}
+    return {
+        C.ENVELOPE_KEY_STATUS: status,
+        C.ENVELOPE_KEY_MESSAGE: message,
+        C.ENVELOPE_KEY_DATA: data,
+    }
 
 def api_error(http_status: int, error_code: str, message: str, *, extra: Optional[dict] = None) -> StarletteHTTPException:
-    data = {"error_code": error_code}
+    data = {C.ENVELOPE_KEY_ERROR_CODE: error_code}
     if extra:
         data.update(extra)
-    return StarletteHTTPException(status_code=http_status, detail={"message": message, **data})
+    return StarletteHTTPException(
+        status_code=http_status,
+        detail={C.ENVELOPE_KEY_MESSAGE: message, **data}
+    )
 
 def require_api_key(x_api_key: Optional[str]) -> None:
     if not x_api_key or x_api_key != C.API_KEY:
         raise api_error(
             C.HTTP_401_UNAUTHORIZED,
             C.ERR_AUTH_INVALID_API_KEY,
-            "Invalid API key",
+            C.MSG_INVALID_API_KEY,
         )
 
 # ============================================================
@@ -65,9 +73,9 @@ def require_api_key(x_api_key: Optional[str]) -> None:
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     detail = exc.detail
-    msg = detail.get("message", "An error occurred") if isinstance(detail, dict) else str(detail)
-    data = {k: v for k, v in detail.items() if k != "message"} if isinstance(detail, dict) else {}
-    data.setdefault("path", request.url.path)
+    msg = detail.get(C.ENVELOPE_KEY_MESSAGE, C.MSG_ERROR_OCCURRED) if isinstance(detail, dict) else str(detail)
+    data = {k: v for k, v in detail.items() if k != C.ENVELOPE_KEY_MESSAGE} if isinstance(detail, dict) else {}
+    data.setdefault(C.ENVELOPE_KEY_PATH, request.url.path)
     return JSONResponse(
         status_code=exc.status_code,
         content=envelope(C.RESP_STATUS_ERROR, msg, data),
@@ -75,9 +83,23 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    details = exc.errors()
+    raw_details = exc.errors()
+
+    # Ensure all details are JSON-serializable (e.g. ctx.error may contain ValueError objects)
+    details: list[dict] = []
+    for err in raw_details:
+        err_copy = dict(err)
+        ctx = err_copy.get("ctx")
+        if isinstance(ctx, dict):
+            ctx_copy = dict(ctx)
+            error_obj = ctx_copy.get("error")
+            if error_obj is not None and not isinstance(error_obj, str):
+                ctx_copy["error"] = str(error_obj)
+            err_copy["ctx"] = ctx_copy
+        details.append(err_copy)
+
     message = " ; ".join(
-        f"{'.'.join(str(x) for x in err.get('loc', []) if x not in ('body',))}: {err.get('msg', 'Invalid value')}"
+        f"{'.'.join(str(x) for x in err.get('loc', []) if x not in ('body',))}: {err.get('msg', C.MSG_INVALID_VALUE)}"
         for err in details
     )
     return JSONResponse(
@@ -85,7 +107,11 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         content=envelope(
             C.RESP_STATUS_ERROR,
             message,
-            {"error_code": C.ERR_VALIDATION_ERROR, "path": request.url.path, "details": details},
+            {
+                C.ENVELOPE_KEY_ERROR_CODE: C.ERR_VALIDATION_ERROR,
+                C.ENVELOPE_KEY_PATH: request.url.path,
+                C.ENVELOPE_KEY_DETAILS: details,
+            },
         ),
     )
 
@@ -95,8 +121,11 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
         status_code=C.HTTP_500_INTERNAL_SERVER_ERROR,
         content=envelope(
             C.RESP_STATUS_ERROR,
-            "Internal server error",
-            {"error_code": C.ERR_INTERNAL_ERROR, "path": request.url.path},
+            C.MSG_INTERNAL_SERVER_ERROR,
+            {
+                C.ENVELOPE_KEY_ERROR_CODE: C.ERR_INTERNAL_ERROR,
+                C.ENVELOPE_KEY_PATH: request.url.path,
+            },
         ),
     )
 
@@ -105,7 +134,13 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 # ============================================================
 
 class GenerateRequest(BaseModel):
-    type: str = Field(..., description="Feasibility_report | Technical_scope | Commercial_proposal")
+    type: str = Field(
+        ...,
+        description=(
+            "Report type. Accepted values (case-insensitive, '-' or '_' allowed): "
+            "commercial-proposal | feasibility-report | technical-scope"
+        ),
+    )
     customer_id: str
     opportunity_id: str
     section_title: str
@@ -113,12 +148,32 @@ class GenerateRequest(BaseModel):
     @field_validator("type")
     @classmethod
     def _validate_type(cls, v: str) -> str:
-        if v not in C.REPORT_TYPES:
+        # Normalise common frontend variants into the canonical kebab-case values
+        # that the backend uses internally (see src.api.constants.REPORT_TYPES).
+        normalised = v.strip().lower().replace("_", "-")
+        if normalised not in C.REPORT_TYPES:
             raise ValueError(f"Unsupported type. Allowed: {sorted(C.REPORT_TYPES)}")
-        return v
+        return normalised
+
+    @model_validator(mode="after")
+    def _validate_section_title(self):
+        """Validate that section_title is allowed for the given report type."""
+        if not C.is_section_allowed_for_report_type(self.type, self.section_title):
+            allowed_sections = C.get_allowed_sections_for_report_type(self.type)
+            raise ValueError(
+                f"Section '{self.section_title}' is not allowed for report type '{self.type}'. "
+                f"Allowed sections: {allowed_sections}"
+            )
+        return self
 
 class RefineRequest(BaseModel):
-    type: str = Field(..., description="Feasibility_report | Technical_scope | Commercial_proposal")
+    type: str = Field(
+        ...,
+        description=(
+            "Report type. Accepted values (case-insensitive, '-' or '_' allowed): "
+            "commercial-proposal | feasibility-report | technical-scope"
+        ),
+    )
     customer_id: str
     opportunity_id: str
     section_title: str
@@ -128,14 +183,28 @@ class RefineRequest(BaseModel):
     @field_validator("type")
     @classmethod
     def _validate_type(cls, v: str) -> str:
-        if v not in C.REPORT_TYPES:
+        # Apply the same normalisation logic as GenerateRequest.type
+        normalised = v.strip().lower().replace("_", "-")
+        if normalised not in C.REPORT_TYPES:
             raise ValueError(f"Unsupported type. Allowed: {sorted(C.REPORT_TYPES)}")
-        return v
+        return normalised
 
-# In-memory request store (dev)
+    @model_validator(mode="after")
+    def _validate_section_title(self):
+        """Validate that section_title is allowed for the given report type."""
+        if not C.is_section_allowed_for_report_type(self.type, self.section_title):
+            allowed_sections = C.get_allowed_sections_for_report_type(self.type)
+            raise ValueError(
+                f"Section '{self.section_title}' is not allowed for report type '{self.type}'. "
+                f"Allowed sections: {allowed_sections}"
+            )
+        return self
 
+# Job storage instance
+job_storage = get_storage()
+
+# Session states cache (for backward compatibility if needed)
 SESSION_STATES: dict[str, SessionState] = {}
-REQUESTS: Dict[str, Dict[str, Any]] = {}
 
 async def generate_section_internal(
     *,
@@ -153,22 +222,27 @@ async def generate_section_internal(
         section_title=section_title,
         explicit_requirements=explicit_requirements,
     )
-    return result["content"]
+    return result[C.RESULT_KEY_CONTENT]
 
-
-import asyncio
-
-async def job_generate(request_id: str) -> None:
-    req_state = REQUESTS.get(request_id)
-    if not req_state:
+async def job_generate(job_id: str) -> None:
+    """Background job handler for section generation."""
+    job = job_storage.get_job(job_id)
+    if not job:
         return
-
+    
     try:
-        # immediately visible to polling
-        req_state["busy"] = True
-        req_state["status"] = C.RESP_STATUS_PROCESSING
-        req_state["message"] = "Generating..."
-
+        # Update job status to processing
+        job.update_status(JobStatus.PROCESSING)
+        job_storage.update_job(job)
+        
+        # Extract job metadata
+        metadata = job.metadata
+        session_id = metadata.get(C.METADATA_KEY_SESSION_ID)
+        customer_id = metadata.get(C.METADATA_KEY_CUSTOMER_ID)
+        opportunity_id = metadata.get(C.METADATA_KEY_OPPORTUNITY_ID)
+        report_type = metadata.get(C.METADATA_KEY_TYPE)
+        section_title = metadata.get(C.METADATA_KEY_SECTION_TITLE)
+        
         loop = asyncio.get_running_loop()
 
         def blocking_work() -> str:
@@ -178,48 +252,58 @@ async def job_generate(request_id: str) -> None:
             """
             session_state = asyncio.run(
                 prepare_session_state(
-                    session_id=req_state["session_id"],
-                    customer_id=req_state["customer_id"],
-                    opportunity_id=req_state["opportunity_id"],
-                    report_type=req_state["type"],
+                    session_id=session_id,
+                    customer_id=customer_id,
+                    opportunity_id=opportunity_id,
+                    report_type=report_type,
                 )
             )
-
-         
 
             return asyncio.run(
                 generate_section_internal(
                     state=session_state,
-                    report_type=req_state["type"],
-                    section_title=req_state["section_title"],
+                    report_type=report_type,
+                    section_title=section_title,
                     explicit_requirements=None,
                 )
             )
 
-        #  heavy work fully off event loop
+        # Heavy work fully off event loop
         section_text: str = await loop.run_in_executor(None, blocking_work)
 
-        req_state["busy"] = False
-        req_state["status"] = C.RESP_STATUS_READY
-        req_state["message"] = "Draft ready"
-        req_state["data"] = {
-            "customer_id": req_state["customer_id"],
-            "opportunity_id": req_state["opportunity_id"],
-            "section_title": req_state["section_title"],
-            "generated_section_b64": section_text,
-        }
+        # Encode generated markdown content as base64 to match the public API contract.
+        section_text_b64 = base64.b64encode(section_text.encode("utf-8")).decode("ascii")
+
+        # Update job with result
+        job.update_status(
+            JobStatus.COMPLETED,
+            result={
+                C.RESP_DATA_KEY_CUSTOMER_ID: customer_id,
+                C.RESP_DATA_KEY_OPPORTUNITY_ID: opportunity_id,
+                C.RESP_DATA_KEY_SECTION_TITLE: section_title,
+                C.RESP_DATA_KEY_GENERATED_SECTION_B64: section_text_b64,
+            }
+        )
+        job_storage.update_job(job)
 
     except Exception as e:
-        req_state["busy"] = False
-        req_state["status"] = C.RESP_STATUS_ERROR
-        req_state["message"] = str(e)
-        req_state["data"] = {"error_code": C.ERR_INTERNAL_ERROR}
+        # Update job with error
+        job.update_status(
+            JobStatus.FAILED,
+            error={
+                C.ENVELOPE_KEY_ERROR_CODE: C.ERR_INTERNAL_ERROR,
+                C.ENVELOPE_KEY_MESSAGE: str(e),
+            }
+        )
+        job_storage.update_job(job)
 
-## Refine Section Logic
+# ============================================================
+# Refine Section Logic
+# ============================================================
 
 async def refine_section_internal(
     *,
-    session_id:str,
+    session_id: str,
     report_type: str,
     section_title: str,
     original_text: str,
@@ -227,31 +311,45 @@ async def refine_section_internal(
 ) -> str:
     """
     Pure business logic: refine an existing section.
+
+    The public API contract expects `original_text` to be base64-encoded UTF-8.
+    Decode it here so the core refine logic always receives plain text.
     """
+    try:
+        decoded_original = base64.b64decode(original_text).decode("utf-8")
+    except Exception as e:
+        raise ValueError(f"Invalid base64 in original_text: {e}") from e
+
     result = await refine_section(
-        session_id = session_id,
+        session_id=session_id,
         report_type=report_type,
         section_title=section_title,
-        original_text=original_text,
+        original_text=decoded_original,
         user_prompt=user_prompt,
     )
-    return result["refined_section"]
+    return result[C.RESULT_KEY_REFINED_SECTION]
 
 
 
-## Job refine
-
-async def job_refine(request_id: str) -> None:
-    req_state = REQUESTS.get(request_id)
-    if not req_state:
+async def job_refine(job_id: str) -> None:
+    """Background job handler for section refinement."""
+    job = job_storage.get_job(job_id)
+    if not job:
         return
-
+    
     try:
-        # immediately visible to pollers
-        req_state["busy"] = True
-        req_state["status"] = C.RESP_STATUS_PROCESSING
-        req_state["message"] = "Refining..."
-
+        # Update job status to processing
+        job.update_status(JobStatus.PROCESSING)
+        job_storage.update_job(job)
+        
+        # Extract job metadata
+        metadata = job.metadata
+        session_id = metadata.get(C.METADATA_KEY_SESSION_ID)
+        report_type = metadata.get(C.METADATA_KEY_TYPE)
+        section_title = metadata.get(C.METADATA_KEY_SECTION_TITLE)
+        original_text = metadata.get(C.METADATA_KEY_ORIGINAL_TEXT)
+        user_prompt = metadata.get(C.METADATA_KEY_USER_PROMPT)
+        
         loop = asyncio.get_running_loop()
 
         def blocking_work() -> str:
@@ -259,39 +357,44 @@ async def job_refine(request_id: str) -> None:
             Runs in a worker thread.
             Safe to block and to use asyncio.run().
             """
-
-            session_id = req_state["session_id"]
-
-        
-         ### CAN PUT PREPARE STSTE IF SYNC SECTIONS IS DISABLED###
             return asyncio.run(
                 refine_section_internal(
                     session_id=session_id,
-                    report_type=req_state["type"],
-                    section_title=req_state["section_title"],
-                    original_text=req_state["original_text"],
-                    user_prompt=req_state["user_prompt"],
+                    report_type=report_type,
+                    section_title=section_title,
+                    original_text=original_text,
+                    user_prompt=user_prompt,
                 )
             )
 
-        # heavy work fully off the event loop
+        # Heavy work fully off the event loop
         refined_text: str = await loop.run_in_executor(None, blocking_work)
 
-        req_state["busy"] = False
-        req_state["status"] = C.RESP_STATUS_READY
-        req_state["message"] = "Refined text ready"
-        req_state["data"] = {
-            "customer_id": req_state["customer_id"],
-            "opportunity_id": req_state["opportunity_id"],
-            "section_title": req_state["section_title"],
-            "refined_section_b64": refined_text,
-        }
+        # Encode refined markdown content as base64 to match the public API contract.
+        refined_text_b64 = base64.b64encode(refined_text.encode("utf-8")).decode("ascii")
+
+        # Update job with result
+        job.update_status(
+            JobStatus.COMPLETED,
+            result={
+                C.RESP_DATA_KEY_CUSTOMER_ID: metadata.get(C.METADATA_KEY_CUSTOMER_ID),
+                C.RESP_DATA_KEY_OPPORTUNITY_ID: metadata.get(C.METADATA_KEY_OPPORTUNITY_ID),
+                C.RESP_DATA_KEY_SECTION_TITLE: section_title,
+                C.RESP_DATA_KEY_REFINED_SECTION_B64: refined_text_b64,
+            }
+        )
+        job_storage.update_job(job)
 
     except Exception as e:
-        req_state["busy"] = False
-        req_state["status"] = C.RESP_STATUS_ERROR
-        req_state["message"] = str(e)
-        req_state["data"] = {"error_code": C.ERR_INTERNAL_ERROR}
+        # Update job with error
+        job.update_status(
+            JobStatus.FAILED,
+            error={
+                C.ENVELOPE_KEY_ERROR_CODE: C.ERR_INTERNAL_ERROR,
+                C.ENVELOPE_KEY_MESSAGE: str(e),
+            }
+        )
+        job_storage.update_job(job)
 
 # ============================================================
 # API Endpoints
@@ -302,86 +405,140 @@ async def generate(
     req: GenerateRequest,
     x_api_key: Optional[str] = Header(None, alias=C.HEADER_API_KEY),
     session_id: Optional[str] = Header(None, alias=C.HEADER_SESSION_ID),
-    request_id: Optional[str] = Header(None, alias=C.HEADER_REQUEST_ID),
 ):
+    """
+    Generate a new section. Returns immediately with a job_id for polling.
+    """
     require_api_key(x_api_key)
 
     if not session_id:
-        raise api_error(C.HTTP_400_BAD_REQUEST, C.ERR_BAD_REQUEST, "Session-Id is required")
-    if not request_id:
-        raise api_error(C.HTTP_400_BAD_REQUEST, C.ERR_BAD_REQUEST, "Request-Id is required")
+        raise api_error(C.HTTP_400_BAD_REQUEST, C.ERR_BAD_REQUEST, C.MSG_SESSION_ID_REQUIRED)
 
-    # Idempotent polling behavior (client re-uses same Request-Id)
-    if request_id in REQUESTS:
-        st = REQUESTS[request_id]
-        if st.get("busy"):
-            return envelope(C.RESP_STATUS_BUSY, "Request is busy", {"ready": False, "request_id": request_id})
-        if st.get("status") == C.RESP_STATUS_READY:
-            return envelope(C.RESP_STATUS_READY, st.get("message", "Ready"), {"ready": True, "request_id": request_id, **(st.get("data") or {})})
-        if st.get("status") == C.RESP_STATUS_ERROR:
-            return envelope(C.RESP_STATUS_ERROR, st.get("message", "Error"), {"ready": False, "request_id": request_id, **(st.get("data") or {})})
-        return envelope(C.RESP_STATUS_PROCESSING, st.get("message", "Processing"), {"ready": False, "request_id": request_id})
+    # Create a new job
+    job = job_storage.create_job(
+        job_type=C.JOB_TYPE_GENERATE,
+        metadata={
+            C.METADATA_KEY_SESSION_ID: session_id,
+            C.METADATA_KEY_TYPE: req.type,
+            C.METADATA_KEY_CUSTOMER_ID: req.customer_id,
+            C.METADATA_KEY_OPPORTUNITY_ID: req.opportunity_id,
+            C.METADATA_KEY_SECTION_TITLE: req.section_title,
+        }
+    )
 
-    REQUESTS[request_id] = {
-        "request_id": request_id,
-        "type": req.type,
-        "customer_id": req.customer_id,
-        "opportunity_id": req.opportunity_id,
-        "section_title": req.section_title,
-        "session_id": session_id,
-        "busy": False,
-        "status": C.RESP_STATUS_OK,
-        "message": "Queued",
-        "data": None,
-    }
+    # Start background processing
+    asyncio.create_task(job_generate(job.job_id))
 
-    asyncio.create_task(job_generate(request_id))
-    return envelope(C.RESP_STATUS_PROCESSING, "Queued", {"ready": False, "request_id": request_id, "session_id": session_id})
+    return envelope(
+        C.RESP_STATUS_PROCESSING,
+        C.MSG_JOB_QUEUED,
+        {
+            C.RESP_DATA_KEY_JOB_ID: job.job_id,
+            C.RESP_DATA_KEY_STATUS: job.status.value,
+        }
+    )
 
 @app.post("/refine", status_code=C.HTTP_202_ACCEPTED)
 async def refine(
     req: RefineRequest,
     x_api_key: Optional[str] = Header(None, alias=C.HEADER_API_KEY),
     session_id: Optional[str] = Header(None, alias=C.HEADER_SESSION_ID),
-    request_id: Optional[str] = Header(None, alias=C.HEADER_REQUEST_ID),
 ):
+    """
+    Refine an existing section. Returns immediately with a job_id for polling.
+    """
     require_api_key(x_api_key)
 
     if not session_id:
-        raise api_error(C.HTTP_400_BAD_REQUEST, C.ERR_BAD_REQUEST, "Session-Id is required")
-    if not request_id:
-        raise api_error(C.HTTP_400_BAD_REQUEST, C.ERR_BAD_REQUEST, "Request-Id is required")
+        raise api_error(C.HTTP_400_BAD_REQUEST, C.ERR_BAD_REQUEST, C.MSG_SESSION_ID_REQUIRED)
 
-    # Idempotent polling behavior
-    if request_id in REQUESTS:
-        st = REQUESTS[request_id]
-        if st.get("busy"):
-            return envelope(C.RESP_STATUS_BUSY, "Request is busy", {"ready": False, "request_id": request_id})
-        if st.get("status") == C.RESP_STATUS_READY:
-            return envelope(C.RESP_STATUS_READY, st.get("message", "Ready"), {"ready": True, "request_id": request_id, **(st.get("data") or {})})
-        if st.get("status") == C.RESP_STATUS_ERROR:
-            return envelope(C.RESP_STATUS_ERROR, st.get("message", "Error"), {"ready": False, "request_id": request_id, **(st.get("data") or {})})
-        return envelope(C.RESP_STATUS_PROCESSING, st.get("message", "Processing"), {"ready": False, "request_id": request_id})
+    # Create a new job
+    job = job_storage.create_job(
+        job_type=C.JOB_TYPE_REFINE,
+        metadata={
+            C.METADATA_KEY_SESSION_ID: session_id,
+            C.METADATA_KEY_TYPE: req.type,
+            C.METADATA_KEY_CUSTOMER_ID: req.customer_id,
+            C.METADATA_KEY_OPPORTUNITY_ID: req.opportunity_id,
+            C.METADATA_KEY_SECTION_TITLE: req.section_title,
+            C.METADATA_KEY_ORIGINAL_TEXT: req.original_text,
+            C.METADATA_KEY_USER_PROMPT: req.prompt,
+        }
+    )
 
-    REQUESTS[request_id] = {
-        "request_id": request_id,
-        "type": req.type,
-        "customer_id": req.customer_id,
-        "opportunity_id": req.opportunity_id,
-        "section_title": req.section_title,
-        "original_text": req.original_text,
-        "user_prompt": req.prompt,
-        "session_id": session_id,
-        "busy": False,
-        "status": C.RESP_STATUS_OK,
-        "message": "Queued",
-        "data": None,
-    }
+    # Start background processing
+    asyncio.create_task(job_refine(job.job_id))
 
-    asyncio.create_task(job_refine(request_id))
-    return envelope(C.RESP_STATUS_PROCESSING, "Queued", {"ready": False, "request_id": request_id, "session_id": session_id})
+    return envelope(
+        C.RESP_STATUS_PROCESSING,
+        C.MSG_JOB_QUEUED,
+        {
+            C.RESP_DATA_KEY_JOB_ID: job.job_id,
+            C.RESP_DATA_KEY_STATUS: job.status.value,
+        }
+    )
+
+
+@app.get("/status/{job_id}", status_code=C.HTTP_200_OK)
+async def get_job_status(
+    job_id: str = PathParam(..., description="Job ID returned from /generate or /refine"),
+    x_api_key: Optional[str] = Header(None, alias=C.HEADER_API_KEY),
+):
+    """
+    Get the status of a background job.
+    Returns job status, result (when completed), or error (when failed).
+    """
+    require_api_key(x_api_key)
+
+    job = job_storage.get_job(job_id)
+    if not job:
+        raise api_error(
+            C.HTTP_404_NOT_FOUND,
+            C.ERR_JOB_NOT_FOUND,
+            C.MSG_JOB_NOT_FOUND.format(job_id=job_id),
+        )
+
+    # Map job status to response status
+    if job.status == JobStatus.COMPLETED:
+        return envelope(
+            C.RESP_STATUS_READY,
+            C.MSG_JOB_COMPLETED,
+            {
+                C.RESP_DATA_KEY_JOB_ID: job.job_id,
+                C.RESP_DATA_KEY_STATUS: job.status.value,
+                C.RESP_DATA_KEY_RESULT: job.result,
+            }
+        )
+    elif job.status == JobStatus.FAILED:
+        return envelope(
+            C.RESP_STATUS_ERROR,
+            C.MSG_JOB_FAILED,
+            {
+                C.RESP_DATA_KEY_JOB_ID: job.job_id,
+                C.RESP_DATA_KEY_STATUS: job.status.value,
+                C.RESP_DATA_KEY_ERROR: job.error,
+            }
+        )
+    elif job.status == JobStatus.PROCESSING:
+        return envelope(
+            C.RESP_STATUS_PROCESSING,
+            C.MSG_JOB_PROCESSING,
+            {
+                C.RESP_DATA_KEY_JOB_ID: job.job_id,
+                C.RESP_DATA_KEY_STATUS: job.status.value,
+            }
+        )
+    else:  # PENDING
+        return envelope(
+            C.RESP_STATUS_PROCESSING,
+            C.MSG_JOB_PENDING,
+            {
+                C.RESP_DATA_KEY_JOB_ID: job.job_id,
+                C.RESP_DATA_KEY_STATUS: job.status.value,
+            }
+        )
 
 if __name__ == "__main__":
-
-    port = int(os.getenv("PORT", "8080"))
+    DEFAULT_PORT = 5001
+    port = int(os.getenv("PORT", str(DEFAULT_PORT)))
     uvicorn.run("main:app", host="0.0.0.0", port=port)

@@ -159,14 +159,17 @@ async def ensure_context_extracted(state: SessionState) -> Dict[str, Any]:
     ):
         return {}
 
-    if not state.transcripts_loaded:
-        raise ValueError("Transcripts must be loaded before extracting facts.")
-
     if not state.transcripts:
+        # No transcripts available for this session (e.g. no files uploaded).
+        # Mark context as extracted so downstream nodes can proceed, but leave
+        # context as None to signal "no transcript-derived facts".
         return {
-            "context_extracted": False,
+            "context_extracted": True,
             "context": None,
         }
+        
+    if not state.transcripts_loaded:
+        raise ValueError("Transcripts must be loaded before extracting facts.")
     
     print("Extracting context/facts from transcripts...")
 

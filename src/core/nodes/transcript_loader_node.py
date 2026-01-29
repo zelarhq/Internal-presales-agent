@@ -242,13 +242,16 @@ async def ensure_transcripts_loaded(state: SessionState) -> SessionState:
 
     print("Loading transcripts for the given opportunity......")
 
+    # If identifiers are missing (e.g. legacy data or documents not linked to
+    # an opportunity), skip transcript loading instead of failing the graph.
+    # The rest of the pipeline can continue using other context sources.
     if not customer_id or not opportunity_id:
-        raise ValueError("customer_id and opportunity_id are required to load transcripts")
+        return state
 
     return await load_transcripts_once_per_session(
         state,
-        customer_id=state.customer_id,
-        opportunity_id=state.opportunity_id,
+        customer_id=customer_id,
+        opportunity_id=opportunity_id,
         fail_fast=state.fail_fast,
     )
 

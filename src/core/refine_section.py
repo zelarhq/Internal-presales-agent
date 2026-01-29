@@ -86,8 +86,9 @@ async def refine_section(
     user_prompt: str,
 ) -> Dict[str, Any]:
 
-    if not original_text:
-        raise ValueError("original_text is required")
+    # original_text may be empty when the caller wants the LLM to generate
+    # content from scratch based on the prompt. We only require that the
+    # parameter is present, not that it is non-empty.
 
     def extract_state(cp) -> SessionState:
         if cp is None:
@@ -113,9 +114,12 @@ async def refine_section(
 
 
 
-    async with AsyncSqliteSaver.from_conn_string(
-        ".temp/langgraph_checkpoints.sqlite"
-    ) as checkpointer:
+    # Ensure the checkpoint directory exists before opening SQLite, otherwise
+    # we may see "unable to open database file" errors.
+    db_path = Path(".temp") / "langgraph_checkpoints.sqlite"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    async with AsyncSqliteSaver.from_conn_string(str(db_path)) as checkpointer:
 
         cp = await checkpointer.aget(
             config={"configurable": {"thread_id": session_id}}
@@ -127,7 +131,7 @@ async def refine_section(
         state: SessionState = extract_state(cp)
 
         facts_text = ""
-        if state.context and state.context_extracted:
+        if state and state.context and state.context_extracted:
             facts_path = Path(state.context.path)
             if facts_path.exists():
                 facts_text = facts_path.read_text(
