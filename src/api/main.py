@@ -22,6 +22,17 @@ from pathlib import Path
 BASE_PATH = Path(__file__).parent.parent
 
 
+def decode_base64_text(b64_string: str) -> str:
+    """
+    Decode base64-encoded UTF-8 text. Handles unpadded or whitespace-mangled
+    strings from clients (e.g. browser btoa() often omits padding).
+    """
+    b64 = "".join(b64_string.split())
+    pad_len = (4 - len(b64) % 4) % 4
+    padded = b64 + "=" * pad_len
+    return base64.b64decode(padded).decode("utf-8")
+
+
 # ===========================================
 # App Configuration
 # ============================================================
@@ -316,12 +327,7 @@ async def refine_section_internal(
     Decode it here so the core refine logic always receives plain text.
     """
     try:
-        # Strip whitespace (e.g. newlines from JSON/HTTP) so length matches data chars
-        b64 = "".join(original_text.split())
-        # Base64 length must be a multiple of 4; pad with '=' if needed
-        pad_len = (4 - len(b64) % 4) % 4
-        b64_padded = b64 + "=" * pad_len
-        decoded_original = base64.b64decode(b64_padded).decode("utf-8")
+        decoded_original = decode_base64_text(original_text)
     except Exception as e:
         raise ValueError(f"Invalid base64 in original_text: {e}") from e
 
