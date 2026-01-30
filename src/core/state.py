@@ -34,7 +34,8 @@ class SectionSnapshot(BaseModel):
 class SectionRef(BaseModel):
     section_id: str
     key: str
-    path: str
+    md_path: str
+    docs_path:Optional[str] = None
     updated_at: float
     source: str = "db"  # db | generated | human
 

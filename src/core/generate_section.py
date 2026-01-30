@@ -7,6 +7,7 @@ from src.core import state
 from src.core import state
 from src.core.graphs.build_session_graph import build_sessiongraph
 from src.core.state import SessionState
+from src.core.tools.markdown_to_doc import markdown_file_to_docx
 # from src.core.nodes.section_writer_node import ensure_section_generated
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
@@ -129,6 +130,8 @@ PREVIOUS SECTIONS FOR REFERENCE(aUTHORITATIVE):
 
 You are producing a polished consulting deliverable for a specific section of a larger report.
 
+Do NOT refer or mention the report itself.
+
 Objectives and Audience:
 
     Write for senior decision-makers.
@@ -180,7 +183,7 @@ Structure and Formatting:
 
 Output Requirement:
 
-    Return only the final section content as text.
+    Return only the final section content as markdown.
 
     Do not include explanations, process notes, or references to instructions.
 
@@ -194,7 +197,8 @@ Output Requirement:
 
 def finalise_section(section_name, section_content, section_rules) -> str:
     prompt = f"""
-You are a content editor for a consulting report section.
+You are a content editor for a report section.
+
 
 SECTION TITLE
 {section_name}
@@ -209,7 +213,7 @@ From the section content below:
 - Ensure there are no mentions of meetings, calls, emails, coordination activities, or individual names.
 - Ensure there is no content dump.
 - Ensure the tone is professional consulting-style.
-- Return in text format.
+- Return in markdown format.
 
 
 Section Content
@@ -334,12 +338,18 @@ async def write_section(
     section_path = session_dir / f"{section_key}.md"
     section_path.write_text(section_md, encoding="utf-8")
 
+    # 7. convert to docx
+    section_docx_path = session_dir / f"{section_key}.docx"
+    section_docx = markdown_file_to_docx(section_path, section_docx_path)
+   
+
     now = time.time()
 
     section_ref = SectionRef(
         section_id=f"{section_key}_{int(now)}",
         key=section_key,
-        path=str(section_path),
+        md_path=str(section_path),
+        docx_path=str(section_docx_path),
         updated_at=now,
         source="generated",
     )
@@ -347,7 +357,7 @@ async def write_section(
     return {
         "key": section_key,
         "title": section_title,
-        "content": section_md,
+        "content": section_docx,
         "report_type": report_type,
         "completed_sections": {
             **state.completed_sections,

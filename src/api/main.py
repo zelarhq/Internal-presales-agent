@@ -283,7 +283,7 @@ async def job_generate(job_id: str) -> None:
         section_text: str = await loop.run_in_executor(None, blocking_work)
 
         # Encode generated markdown content as base64 to match the public API contract.
-        section_text_b64 = base64.b64encode(section_text.encode("utf-8")).decode("ascii")
+        section_text_b64 = base64.b64encode(section_text).decode("ascii")
 
         # Update job with result
         job.update_status(

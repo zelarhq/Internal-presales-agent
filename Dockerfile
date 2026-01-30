@@ -9,6 +9,7 @@ WORKDIR /app
 # System deps (for things like psycopg2, building wheels, etc.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    pandoc \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python deps

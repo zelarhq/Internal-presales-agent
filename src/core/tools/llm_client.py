@@ -105,6 +105,7 @@ def generate_text(
     system = (
         "You are a helpful assistant. "
         "Provide clear, professional, consulting-style responses."
+        "Use Markdown formatting."
     )
 
     user = prompt
